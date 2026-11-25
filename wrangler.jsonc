@@ -1,0 +1,9 @@
+// releases.remyral.com: static assets only, no Worker code. Every file is signed with the Remyral release keys.
+{
+  "name": "remyral-releases",
+  "compatibility_date": "2026-11-20",
+  "assets": {
+    "directory": "./",
+    "not_found_handling": "none"
+  }
+}
