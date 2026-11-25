@@ -1,0 +1,99 @@
+{
+  "schema": 1,
+  "name": "remyral-worker-feed",
+  "channel": "stable",
+  "generatedAt": "2026-11-25T19:36:33.645Z",
+  "catalogKeys": [],
+  "releases": [
+    {
+      "version": "1.2.21",
+      "channel": "stable",
+      "publishedAt": "2026-11-24T02:14:54.167Z",
+      "protocolVersions": [
+        "1.0"
+      ],
+      "minNode": "24.11.0",
+      "sha256": "b67ecb2d6752f0f971517a2c41031bf788fe5f1a9a1579e56d592c986859672f",
+      "size": 5426062,
+      "bundle": {
+        "path": "1.2.21/release.json",
+        "sha256": "b2bcdc24ecfc73a0dd060893e701f5c71c0c4feb3823e109440db9dd018365b4",
+        "size": 13933335
+      },
+      "summary": "",
+      "notes": ""
+    },
+    {
+      "version": "1.2.20",
+      "channel": "stable",
+      "publishedAt": "2026-11-23T21:21:18.487Z",
+      "protocolVersions": [
+        "1.0"
+      ],
+      "minNode": "24.11.0",
+      "sha256": "5c057ab082d6c57cd50a7ae69b115bb4a21964e2d7067d650d16a897da661e0e",
+      "size": 5398999,
+      "bundle": {
+        "path": "1.2.20/release.json",
+        "sha256": "4c20aea2965d7b7c3232399090440f295697bc2a0dab98e33b481fefe4ddfde5",
+        "size": 13834459
+      },
+      "summary": "",
+      "notes": ""
+    },
+    {
+      "version": "1.2.19",
+      "channel": "stable",
+      "publishedAt": "2026-11-05T21:04:47.877Z",
+      "protocolVersions": [
+        "1.0"
+      ],
+      "minNode": "24.11.0",
+      "sha256": "cf6f1818fa277a170fd1196e0963cefff35cbb16d8499c1da66c2b685c911760",
+      "size": 6948494,
+      "bundle": {
+        "path": "1.2.19/release.json",
+        "sha256": "7c084736ef31e19d6d6b48b980dbd1f8a77b4a781ba342431a73816e469f1f2a",
+        "size": 17640819
+      },
+      "summary": "",
+      "notes": ""
+    },
+    {
+      "version": "1.2.18",
+      "channel": "stable",
+      "publishedAt": "2026-11-04T23:49:33.649Z",
+      "protocolVersions": [
+        "1.0"
+      ],
+      "minNode": "24.11.0",
+      "sha256": "99dacd2232b9aea24748759998ee4891dd0844f07d01d98be997b79e4981f72e",
+      "size": 6946361,
+      "bundle": {
+        "path": "1.2.18/release.json",
+        "sha256": "5246d1104f04e6785c625d518da1b990daf6daef80136d581120a3c9115c5b4a",
+        "size": 17635747
+      },
+      "summary": "",
+      "notes": ""
+    },
+    {
+      "version": "1.2.17",
+      "channel": "stable",
+      "publishedAt": "2026-11-02T13:52:44.122Z",
+      "protocolVersions": [
+        "1.0"
+      ],
+      "minNode": "24.11.0",
+      "sha256": "c5668f3e548ccf218acd73aed79126b8c59981f001168c4b863efed392960e36",
+      "size": 6939684,
+      "bundle": {
+        "path": "1.2.17/release.json",
+        "sha256": "f5a27dc764e074577924fc3b0d4db92d42f6c3bf2de5068897cf0a4ded929120",
+        "size": 17615607
+      },
+      "summary": "",
+      "notes": ""
+    }
+  ]
+}

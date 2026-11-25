@@ -1,0 +1,12 @@
+/workers/feed.json
+  Cache-Control: no-cache
+  X-Content-Type-Options: nosniff
+/workers/feed.sig.json
+  Cache-Control: no-cache
+  X-Content-Type-Options: nosniff
+/catalog/*
+  Cache-Control: no-cache
+  X-Content-Type-Options: nosniff
+/workers/*/release.json
+  Cache-Control: public, max-age=86400, immutable
+  X-Content-Type-Options: nosniff
