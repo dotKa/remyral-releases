@@ -2,9 +2,29 @@
   "schema": 1,
   "name": "remyral-worker-feed",
   "channel": "stable",
-  "generatedAt": "2026-11-25T19:36:33.645Z",
-  "catalogKeys": [],
+  "generatedAt": "2026-11-26T15:05:21.834Z",
+  "catalogKeys": [
+    "T7jJpg2NdDhvsDT6410kvx902nAOFLzKI4z3V_Qv3Fw"
+  ],
   "releases": [
+    {
+      "version": "1.2.22",
+      "channel": "stable",
+      "publishedAt": "2026-11-26T15:05:02.636Z",
+      "protocolVersions": [
+        "1.0"
+      ],
+      "minNode": "24.11.0",
+      "sha256": "a874b7309c03da8f2279cf3f2b2dc3deb57116454a11298fb79c572407f72146",
+      "size": 5428115,
+      "bundle": {
+        "path": "1.2.22/release.json",
+        "sha256": "982790dc59147fe4b3ed9d4d06933dcb2595911e4da8f962715f0468da77dd03",
+        "size": 13939623
+      },
+      "summary": "",
+      "notes": ""
+    },
     {
       "version": "1.2.21",
       "channel": "stable",
@@ -73,24 +93,6 @@
         "path": "1.2.18/release.json",
         "sha256": "5246d1104f04e6785c625d518da1b990daf6daef80136d581120a3c9115c5b4a",
         "size": 17635747
-      },
-      "summary": "",
-      "notes": ""
-    },
-    {
-      "version": "1.2.17",
-      "channel": "stable",
-      "publishedAt": "2026-11-02T13:52:44.122Z",
-      "protocolVersions": [
-        "1.0"
-      ],
-      "minNode": "24.11.0",
-      "sha256": "c5668f3e548ccf218acd73aed79126b8c59981f001168c4b863efed392960e36",
-      "size": 6939684,
-      "bundle": {
-        "path": "1.2.17/release.json",
-        "sha256": "f5a27dc764e074577924fc3b0d4db92d42f6c3bf2de5068897cf0a4ded929120",
-        "size": 17615607
       },
       "summary": "",
       "notes": ""
