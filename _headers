@@ -10,3 +10,12 @@
 /workers/*/release.json
   Cache-Control: public, max-age=86400, immutable
   X-Content-Type-Options: nosniff
+/control-plane/feed.json
+  Cache-Control: no-cache
+  X-Content-Type-Options: nosniff
+/control-plane/feed.sig.json
+  Cache-Control: no-cache
+  X-Content-Type-Options: nosniff
+/control-plane/:version/*
+  Cache-Control: public, max-age=86400, immutable
+  X-Content-Type-Options: nosniff

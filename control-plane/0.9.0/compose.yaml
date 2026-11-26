@@ -1,0 +1,551 @@
+# Remyral control plane for a Coolify "Docker Compose" resource (p1-data-services, p1-environments).
+# Step-by-step: docs/ops/deploy-coolify.md. Local end-to-end check: `pnpm e2e:compose`.
+#
+# Topology (one compose project per environment; production and staging differ only in variables):
+#
+#   Cloudflare ─TLS─▶ coolify-proxy (Traefik, :443) ──┬─ /api/*  (prefix stripped) ─▶ master:8080
+#                                                     ├─ /v1/worker, /v1/worker/releases/* ─▶ master:8080
+#                                                     └─ everything else ─────────────────▶ web:8080
+#   master ─▶ postgres:5432 (role remyral_app), redis:6379      [network "internal": no proxy, no ports]
+#   migrate (one-shot, role remyral_owner) runs before master starts.
+#
+# Routing is defined entirely by the Traefik labels below. In Coolify leave the "Domains" field of every
+# service EMPTY so Coolify does not generate competing routers. TLS: the router has `tls=true` without a
+# certresolver, so Traefik serves the certificate from its file provider (Cloudflare Origin Certificate,
+# docs/ops/deploy-coolify.md §4) — or its built-in self-signed default before that is installed.
+#
+# Secrets: database/Redis passwords come from Coolify environment variables (mark them as secrets); key
+# material (TOTP key, lease-signing key, optional SMTP/webhook/GitHub keys) comes from files in
+# ${REMYRAL_SECRETS_DIR} on the host, mounted read-only. Nothing secret is baked into an image.
+#
+# Every `${VAR:?}` must be set; Coolify lists them in the resource's Environment Variables page.
+# REMYRAL_PROJECT: an installation may keep its own compose project name (its containers, volumes and network
+# aliases derive from it); default remyral-<env>.
+name: ${REMYRAL_PROJECT:-remyral-${REMYRAL_ENV:-prod}}
+
+x-hardening: &hardening
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ['no-new-privileges:true']
+  tmpfs:
+    - /tmp:size=64m,mode=1777
+
+x-master-env: &master-env
+  NODE_ENV: production
+  LOG_LEVEL: ${LOG_LEVEL:-info}
+  MASTER_HOST: 0.0.0.0
+  MASTER_PORT: '8080'
+  # Runtime role: owns nothing, so it cannot disable the append-only triggers (p1-master-auth §audit).
+  DATABASE_URL: postgres://${REMYRAL_DB_ROLE_PREFIX:-remyral}_app:${REMYRAL_DB_APP_PASSWORD:?}@remyral-pg:5432/${REMYRAL_DB_NAME:-remyral}
+  DATABASE_POOL_MAX: ${DATABASE_POOL_MAX:-10}
+  REDIS_URL: redis://:${REDIS_PASSWORD:?}@remyral-redis:6379/0
+  TOTP_KEY_FILE: /run/secrets/remyral/totp.key
+  LEASE_SIGNING_KEY_FILE: /run/secrets/remyral/lease-signing.pem
+  # Cloudflare → Traefik → master: one trusted hop (Traefik). Cloudflare's CF-Connecting-IP is honoured
+  # only when the peer Traefik saw is a Cloudflare edge address (apps/master/src/http/client-ip.ts).
+  TRUST_PROXY_HOPS: ${TRUST_PROXY_HOPS:-1}
+  TRUSTED_CLIENT_IP_HEADER: ${TRUSTED_CLIENT_IP_HEADER:-cf-connecting-ip}
+  # https://www.cloudflare.com/ips-v4 + ips-v6 as of 2026-10-13; re-check when Cloudflare announces changes.
+  TRUSTED_CLIENT_IP_SOURCES: ${TRUSTED_CLIENT_IP_SOURCES:-173.245.48.0/20,103.21.244.0/22,103.22.200.0/22,103.31.4.0/22,141.101.64.0/18,108.162.192.0/18,190.93.240.0/20,188.114.96.0/20,197.234.240.0/22,198.41.128.0/17,162.158.0.0/15,104.16.0.0/13,104.24.0.0/14,172.64.0.0/13,131.0.72.0/22,2400:cb00::/32,2606:4700::/32,2803:f800::/32,2405:b500::/32,2405:8100::/32,2a06:98c0::/29,2c0f:f248::/32}
+  WORKER_ROTATION_REQUIRES_APPROVAL: ${WORKER_ROTATION_REQUIRES_APPROVAL:-false}
+  LEASE_TTL_MS: ${LEASE_TTL_MS:-90000}
+  # p11-master-resilience (ADR-0039): running jobs survive a master outage this long (0 = classic ~3 min).
+  LEASE_OFFLINE_GRACE_MS: ${LEASE_OFFLINE_GRACE_MS:-900000}
+  LOGIN_WAIT_MINUTES: ${LOGIN_WAIT_MINUTES:-30}
+  # p17-output-limits: output files per workspace job (inline + storage; the rest is zipped). Panel overrides it.
+  JOB_OUTPUT_MAX_FILES: ${JOB_OUTPUT_MAX_FILES:-500}
+  # Optional features: an empty value means unset (disabled). File paths point into the secrets mount.
+  RELEASE_PUBLIC_KEYS: ${RELEASE_PUBLIC_KEYS:-}
+  # p6-skills: trusted skill signing keys (comma-separated, ≤ 2); empty = skill uploads refused.
+  SKILLS_PUBLIC_KEYS: ${SKILLS_PUBLIC_KEYS:-}
+  # p5-machine-admin (ADR-0021): panel-held skills key for chat-authored skills (file in the secrets mount).
+  SKILLS_PANEL_KEY_FILE: ${SKILLS_PANEL_KEY_FILE:-}
+  NOTIFY_PUBLIC_URL: https://${REMYRAL_DOMAIN:?}
+  # p5-worker-onboarding: origin baked into the Add machine bootstrap scripts; anonymous kit downloads.
+  PUBLIC_ORIGIN: https://${REMYRAL_DOMAIN:?}
+  INSTALLER_PUBLIC_DOWNLOADS: ${INSTALLER_PUBLIC_DOWNLOADS:-true}
+  # p14-workflow-engine (ADR-0055): the new workflow engine (off: every workflow runs on engine 1 unchanged).
+  WORKFLOW_ENGINE_V2: ${WORKFLOW_ENGINE_V2:-false}
+  WORKFLOW_ENGINE_V2_FOR_V1: ${WORKFLOW_ENGINE_V2_FOR_V1:-false}
+  NOTIFY_SMTP_HOST: ${NOTIFY_SMTP_HOST:-}
+  NOTIFY_SMTP_PORT: ${NOTIFY_SMTP_PORT:-}
+  NOTIFY_SMTP_SECURITY: ${NOTIFY_SMTP_SECURITY:-}
+  NOTIFY_SMTP_FROM: ${NOTIFY_SMTP_FROM:-}
+  NOTIFY_SMTP_USERNAME: ${NOTIFY_SMTP_USERNAME:-}
+  NOTIFY_SMTP_PASSWORD_FILE: ${NOTIFY_SMTP_PASSWORD_FILE:-}
+  NOTIFY_WEBHOOK_ALLOWLIST: ${NOTIFY_WEBHOOK_ALLOWLIST:-}
+  NOTIFY_WEBHOOK_SECRET_FILE: ${NOTIFY_WEBHOOK_SECRET_FILE:-}
+  # p8-pwa Web Push: VAPID private key file (e.g. /run/secrets/remyral/vapid.pem) + operator contact; both or neither.
+  PUSH_VAPID_PRIVATE_KEY_FILE: ${PUSH_VAPID_PRIVATE_KEY_FILE:-}
+  PUSH_VAPID_SUBJECT: ${PUSH_VAPID_SUBJECT:-}
+  PUSH_ENDPOINT_ALLOWLIST: ${PUSH_ENDPOINT_ALLOWLIST:-}
+  GITHUB_APP_ID: ${GITHUB_APP_ID:-}
+  GITHUB_APP_PRIVATE_KEY_FILE: ${GITHUB_APP_PRIVATE_KEY_FILE:-}
+  # p6-otel: environment label; optional OTLP export (headers file in the secrets mount). /metrics stays
+  # on 127.0.0.1:9464 inside the container (not routed, not published): `docker exec … fetch`.
+  REMYRAL_ENV: ${REMYRAL_ENV:-prod}
+  OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+  OTEL_EXPORTER_OTLP_HEADERS_FILE: ${OTEL_EXPORTER_OTLP_HEADERS_FILE:-}
+  # p16-observability (docs/ops/monitoring.md §8): Ayarlar → Sistem durumu. The deployed release tag (release.env), the
+  # web probe over the proxy network, the log search (days; 0 = off) and the in-process traces (0 = off). Empty = defaults.
+  REMYRAL_RELEASE_TAG: ${REMYRAL_RELEASE_TAG:-}
+  STATUS_WEB_URL: ${STATUS_WEB_URL:-http://${REMYRAL_PROJECT:-remyral-${REMYRAL_ENV:-prod}}-web:8080/index.html}
+  LOG_STORE_RETENTION_DAYS: ${LOG_STORE_RETENTION_DAYS:-}
+  LOG_STORE_LEVEL: ${LOG_STORE_LEVEL:-}
+  LOG_STORE_REQUESTS: ${LOG_STORE_REQUESTS:-}
+  LOG_STORE_MAX_ROWS: ${LOG_STORE_MAX_ROWS:-}
+  TRACE_RECENT_LIMIT: ${TRACE_RECENT_LIMIT:-}
+  TRACE_SLOW_MS: ${TRACE_SLOW_MS:-}
+  TRACE_DB_SAMPLE_RATIO: ${TRACE_DB_SAMPLE_RATIO:-}
+  TRACE_DB_SLOW_MS: ${TRACE_DB_SLOW_MS:-}
+  # p5-remember-device (optional; empty = defaults 30 / 7 / 30 days, 0 disables the feature).
+  AUTH_TRUSTED_DEVICE_DAYS: ${AUTH_TRUSTED_DEVICE_DAYS:-}
+  AUTH_REMEMBER_IDLE_DAYS: ${AUTH_REMEMBER_IDLE_DAYS:-}
+  AUTH_REMEMBER_ABSOLUTE_DAYS: ${AUTH_REMEMBER_ABSOLUTE_DAYS:-}
+  # p5-stepup-window (optional; empty = 10 minutes / `session`; `off` = 10-minute rule for every session).
+  AUTH_STEP_UP_MINUTES: ${AUTH_STEP_UP_MINUTES:-}
+  AUTH_STEP_UP_TRUSTED: ${AUTH_STEP_UP_TRUSTED:-}
+  # p6-alerts / p6-agentmagnify (optional; token file in the secrets mount).
+  ALERT_INTERVAL_MS: ${ALERT_INTERVAL_MS:-}
+  AGENTMAGNIFY_API_URL: ${AGENTMAGNIFY_API_URL:-}
+  AGENTMAGNIFY_TOKEN_FILE: ${AGENTMAGNIFY_TOKEN_FILE:-}
+  AGENTMAGNIFY_PROJECT_NAME: ${AGENTMAGNIFY_PROJECT_NAME:-}
+  # p6-deploy-integrations (optional; ADR-0028). Tokens are entered in Settings → Integrations, never here.
+  OPS_INTERNAL_ORIGINS: ${OPS_INTERNAL_ORIGINS:-}
+  OPS_CONTROL_PLANE_COOLIFY_UUIDS: ${OPS_CONTROL_PLANE_COOLIFY_UUIDS:-}
+  OPS_CONTROL_PLANE_ADDRESSES: ${OPS_CONTROL_PLANE_ADDRESSES:-}
+  # Host names protected like the console host (the PUBLIC_ORIGIN host always is); comma-separated, empty = none.
+  OPS_PROTECTED_HOSTS: ${OPS_PROTECTED_HOSTS:-}
+  # p5-coolify-sso (optional; docs/ops/coolify-sso.md). Empty = off. Key/secret are files in the secrets mount.
+  SSO_CONSOLE_ORIGIN: ${SSO_CONSOLE_ORIGIN:-}
+  OIDC_SIGNING_KEY_FILE: ${OIDC_SIGNING_KEY_FILE:-}
+  OIDC_COOLIFY_CLIENT_SECRET_FILE: ${OIDC_COOLIFY_CLIENT_SECRET_FILE:-}
+  OIDC_COOLIFY_REDIRECT_URIS: ${OIDC_COOLIFY_REDIRECT_URIS:-}
+  OIDC_EMAIL_MAP: ${OIDC_EMAIL_MAP:-}
+  COOLIFY_SSO_HOST: ${COOLIFY_SSO_HOST:-}
+  # p19-ide W2 (ADR-0066): the Tam IDE origin, e.g. https://ide.<REMYRAL_DOMAIN>. Empty = Tam IDE off (the code viewer
+  # works). Needs DNS, a certificate and the `-ide` router below (docs/ops/deploy-coolify.md).
+  IDE_ORIGIN: ${IDE_ORIGIN:-}
+  # p6-vector (optional semantic search; off unless SEARCH_PROVIDER is set; key file in the secrets mount).
+  SEARCH_PROVIDER: ${SEARCH_PROVIDER:-}
+  SEARCH_HTTP_URL: ${SEARCH_HTTP_URL:-}
+  SEARCH_HTTP_MODEL: ${SEARCH_HTTP_MODEL:-}
+  SEARCH_HTTP_KEY_FILE: ${SEARCH_HTTP_KEY_FILE:-}
+  SEARCH_HTTP_DIMENSIONS: ${SEARCH_HTTP_DIMENSIONS:-}
+  SEARCH_INDEX_INTERVAL_MS: ${SEARCH_INDEX_INTERVAL_MS:-}
+  # p10-semantic-memory: Amazon Bedrock embeddings (SEARCH_PROVIDER=bedrock; default model cohere.embed-multilingual-v3).
+  # Credentials come from the AWS SDK default chain: AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY (+ AWS_SESSION_TOKEN) of an
+  # IAM user allowed only bedrock:InvokeModel on the embedding model, or nothing at all when the EC2 instance has an
+  # instance profile (preferred; IMDSv2 hop limit 2 for containers). Mark the keys as secrets in stack.env; they are
+  # passed to the master only — never to web, migrate or any worker. docs/design/p10-semantic-memory.md §3.
+  # p10-bedrock-integration-panel: Settings → Integrations → AWS Bedrock (keys encrypted in the DB) takes precedence;
+  # these are the fallback. SEARCH_PROVIDER=off is the kill switch (§11).
+  SEARCH_BEDROCK_REGION: ${SEARCH_BEDROCK_REGION:-}
+  SEARCH_BEDROCK_MODEL: ${SEARCH_BEDROCK_MODEL:-}
+  SEARCH_BEDROCK_DIMENSIONS: ${SEARCH_BEDROCK_DIMENSIONS:-}
+  AWS_REGION: ${AWS_REGION:-}
+  AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+  AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+  AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
+  # p10-semantic-memory: memory-suggestion pass period (0 = off) and the semantic duplicate threshold (default 0.9).
+  MEMORY_SUGGEST_INTERVAL_MS: ${MEMORY_SUGGEST_INTERVAL_MS:-}
+  MEMORY_DUPLICATE_THRESHOLD: ${MEMORY_DUPLICATE_THRESHOLD:-}
+  # p10-chat-memory-suggestions: suggestions from shared project-linked chat per thread per day (default 5, 0 = off).
+  MEMORY_CHAT_PER_THREAD_DAY: ${MEMORY_CHAT_PER_THREAD_DAY:-}
+  # p17-auto-learning: kill switch for automatic acceptance of memory suggestions (default on; off = all wait for a person).
+  MEMORY_AUTO_LEARN: ${MEMORY_AUTO_LEARN:-}
+  # p17-embeddings: kill switches for similar jobs / solved failures / duplicate checks (all) and the job-context block.
+  RELATED_WORK: ${RELATED_WORK:-}
+  RELATED_WORK_CONTEXT: ${RELATED_WORK_CONTEXT:-}
+  # p10-backup-restore: status written by the backup service (Settings → Backups, backup/drill alerts).
+  BACKUP_STATUS_DIR: /run/remyral-backup
+  # p17-object-storage: the local blob directory (the `blobdata` volume of the master service).
+  BLOB_DATA_DIR: /var/lib/remyral/blobs
+  # p16-selfhost-onboarding (ADR-0063): the installed version (release.env), the signed update feed (URL and/or the copy
+  # remyral-ctl caches on the host) and the vendor's control-plane release keys. Empty = the update banner is off.
+  REMYRAL_VERSION: ${REMYRAL_VERSION:-}
+  UPDATE_FEED_URL: ${UPDATE_FEED_URL:-}
+  UPDATE_FEED_FILE: /run/remyral-update/feed.json
+  CONTROL_PLANE_RELEASE_KEYS: ${CONTROL_PLANE_RELEASE_KEYS:-}
+  # p17-update-channel (ADR-0065): the worker release feed and the version catalog. Empty = next to UPDATE_FEED_URL /
+  # UPDATE_FEED_FILE (`workers/feed.json`, `catalog/catalog.json`); VERSION_CATALOG=off is the catalog kill switch.
+  WORKER_FEED_URL: ${WORKER_FEED_URL:-}
+  WORKER_FEED_FILE: ${WORKER_FEED_FILE:-}
+  VERSION_CATALOG: ${VERSION_CATALOG:-}
+  VERSION_CATALOG_URL: ${VERSION_CATALOG_URL:-}
+  VERSION_CATALOG_FILE: ${VERSION_CATALOG_FILE:-}
+  VERSION_CATALOG_KEYS: ${VERSION_CATALOG_KEYS:-}
+  # p13-fleet-tools: `off` for masters without outbound internet.
+  FLEET_TOOLS_FEED: ${FLEET_TOOLS_FEED:-}
+  # p17-host-actions: every other setting of apps/master/src/config.ts reaches the master too (empty = the default);
+  # scripts/test/compose-env.test.mjs fails when config.ts reads a variable that is neither passed here nor listed as
+  # deliberately not passed.
+  RATE_LIMIT_SCALE: ${RATE_LIMIT_SCALE:-}
+  BODY_LIMIT_BYTES: ${BODY_LIMIT_BYTES:-}
+  SHUTDOWN_TIMEOUT_MS: ${SHUTDOWN_TIMEOUT_MS:-}
+  METRICS_ENABLED: ${METRICS_ENABLED:-}
+  METRICS_HOST: ${METRICS_HOST:-}
+  METRICS_PORT: ${METRICS_PORT:-}
+  METRICS_TOKEN_FILE: ${METRICS_TOKEN_FILE:-}
+  OTEL_SERVICE_NAME: ${OTEL_SERVICE_NAME:-}
+  JOB_CHECKPOINT_INTERVAL_SEC: ${JOB_CHECKPOINT_INTERVAL_SEC:-}
+  JOB_CHECKPOINT_MAX_MB: ${JOB_CHECKPOINT_MAX_MB:-}
+  JOB_CHECKPOINT_MAX_FILES: ${JOB_CHECKPOINT_MAX_FILES:-}
+  JOB_CHECKPOINT_KEEP: ${JOB_CHECKPOINT_KEEP:-}
+  JOB_RESTART_MAX_RESUMES: ${JOB_RESTART_MAX_RESUMES:-}
+  NOTIFY_INTERVAL_MS: ${NOTIFY_INTERVAL_MS:-}
+  NOTIFY_SMTP_CA_FILE: ${NOTIFY_SMTP_CA_FILE:-}
+  GITHUB_API_URL: ${GITHUB_API_URL:-}
+  GITFLOW_PLAIN_GIT: ${GITFLOW_PLAIN_GIT:-}
+  GITFLOW_CACHE_DIR: ${GITFLOW_CACHE_DIR:-}
+  AGENTMAGNIFY_INTERVAL_MS: ${AGENTMAGNIFY_INTERVAL_MS:-}
+  NODE_OPTIONS: --max-old-space-size=512
+
+services:
+  postgres:
+    # postgres:18.6-alpine, multi-arch index digest, pinned 2026-10-13 (same minor as infra/dev).
+    image: postgres:18.6-alpine@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_SUPERUSER_PASSWORD:?}
+      # Database and role names (`<prefix>_owner|_app|_backup`) of this installation (stack.env; default remyral).
+      POSTGRES_DB: ${REMYRAL_DB_NAME:-remyral}
+      REMYRAL_DB_ROLE_PREFIX: ${REMYRAL_DB_ROLE_PREFIX:-remyral}
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256 --auth-local=peer
+      REMYRAL_DB_OWNER_PASSWORD: ${REMYRAL_DB_OWNER_PASSWORD:?}
+      REMYRAL_DB_APP_PASSWORD: ${REMYRAL_DB_APP_PASSWORD:?}
+      # Optional (p1-backups): login password of the read-only backup role. Empty: the role is created
+      # NOLOGIN and infra/backup/sql/backup-role.sql enables it later (docs/ops/backups.md §3).
+      REMYRAL_DB_BACKUP_PASSWORD: ${REMYRAL_DB_BACKUP_PASSWORD:-}
+      # p11-master-resilience: on = continuous WAL archiving into /wal-archive (default off).
+      PG_WAL_ARCHIVE: ${PG_WAL_ARCHIVE:-off}
+    # First start of an empty volume only: create the migration owner, the restricted runtime role and
+    # the read-only backup role.
+    # The script is written inline (a Coolify compose resource has no repository checkout to mount from)
+    # and runs as the image's normal docker-entrypoint initdb hook. Passwords go in as psql variables
+    # (quoted by psql, never interpolated into SQL text).
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        cat > /docker-entrypoint-initdb.d/10-remyral-roles.sh <<'INIT'
+        #!/bin/sh
+        set -eu
+        psql -v ON_ERROR_STOP=1 --username "$$POSTGRES_USER" --dbname "$$POSTGRES_DB" \
+          -v owner_pw="$$REMYRAL_DB_OWNER_PASSWORD" -v app_pw="$$REMYRAL_DB_APP_PASSWORD" \
+          -v backup_pw="$${REMYRAL_DB_BACKUP_PASSWORD:-}" -v db="$$POSTGRES_DB" \
+          -v owner_role="$${REMYRAL_DB_ROLE_PREFIX}_owner" -v app_role="$${REMYRAL_DB_ROLE_PREFIX}_app" \
+          -v backup_role="$${REMYRAL_DB_ROLE_PREFIX}_backup" <<'SQL'
+        CREATE ROLE :"owner_role" LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE PASSWORD :'owner_pw';
+        CREATE ROLE :"app_role" LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT PASSWORD :'app_pw';
+        ALTER DATABASE :"db" OWNER TO :"owner_role";
+        REVOKE ALL ON DATABASE :"db" FROM PUBLIC;
+        GRANT CONNECT ON DATABASE :"db" TO :"app_role";
+        ALTER SCHEMA public OWNER TO :"owner_role";
+        REVOKE ALL ON SCHEMA public FROM PUBLIC;
+        GRANT USAGE ON SCHEMA public TO :"app_role";
+        -- pg_trgm (migration 0008) is created here by the superuser; the migration's IF NOT EXISTS is a no-op.
+        CREATE EXTENSION IF NOT EXISTS pg_trgm;
+        -- Everything the owner creates later (migrations) is usable — not owned — by the runtime role.
+        -- No TRUNCATE, REFERENCES or TRIGGER: append-only triggers stay in force for the runtime role.
+        ALTER DEFAULT PRIVILEGES FOR ROLE :"owner_role" IN SCHEMA public
+          GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO :"app_role";
+        ALTER DEFAULT PRIVILEGES FOR ROLE :"owner_role" IN SCHEMA public
+          GRANT USAGE, SELECT ON SEQUENCES TO :"app_role";
+        -- p1-backups: pg_dump role. Reads everything (pg_read_all_data), writes nothing, owns nothing.
+        CREATE ROLE :"backup_role" NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE INHERIT;
+        GRANT pg_read_all_data TO :"backup_role" WITH INHERIT TRUE;
+        GRANT CONNECT ON DATABASE :"db" TO :"backup_role";
+        ALTER ROLE :"backup_role" SET default_transaction_read_only = on;
+        -- p11-master-resilience: the physical base backup of the warm standby (low-level API, no write privilege).
+        GRANT EXECUTE ON FUNCTION pg_backup_start(text, boolean), pg_backup_stop(boolean) TO :"backup_role";
+        SELECT :'backup_pw' <> '' AS backup_login \gset
+        \if :backup_login
+        ALTER ROLE :"backup_role" LOGIN PASSWORD :'backup_pw';
+        \endif
+        SQL
+        INIT
+        chmod 0755 /docker-entrypoint-initdb.d/10-remyral-roles.sh
+        # p11-master-resilience (docs/ops/backup-restore.md §10): continuous WAL archiving for the warm standby,
+        # opt-in with PG_WAL_ARCHIVE=on (a change needs a Postgres restart: deploy.mjs --infra). Every completed
+        # segment (at the latest every 180 s while anything is written) is copied durably (fsync, tmp + rename;
+        # an identical existing copy counts as archived) into /wal-archive; the backup service ships it off-site.
+        if [ "$${PG_WAL_ARCHIVE:-off}" = on ]; then
+          mkdir -p /wal-archive && chown postgres:postgres /wal-archive && chmod 0700 /wal-archive
+          set -- -c archive_mode=on -c archive_timeout=180 -c wal_recycle=off \
+            -c 'archive_command=if [ -f /wal-archive/%f ]; then cmp -s %p /wal-archive/%f; else dd if=%p of=/wal-archive/%f.tmp bs=1048576 conv=fsync 2>/dev/null && mv /wal-archive/%f.tmp /wal-archive/%f; fi'
+        fi
+        exec docker-entrypoint.sh postgres "$$@"
+    command: []
+    volumes:
+      # Postgres 18+ images keep PGDATA under /var/lib/postgresql/<major>/docker; mount the parent.
+      - pgdata:/var/lib/postgresql
+      # p11-master-resilience: archived WAL segments (empty and unused unless PG_WAL_ARCHIVE=on).
+      - walarchive:/wal-archive
+    # Unique DNS name: the master also sits on the proxy network, where Coolify's own services
+    # are called `postgres`/`redis` — a bare service name could resolve to Coolify's database.
+    networks:
+      internal:
+        aliases: [remyral-pg]
+    shm_size: 128m
+    mem_limit: 1g
+    security_opt: ['no-new-privileges:true']
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postgres -d "$$POSTGRES_DB" -h 127.0.0.1']
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 20s
+    labels:
+      - traefik.enable=false
+
+  redis:
+    # redis:8.10.2-alpine, multi-arch index digest, pinned 2026-10-13 (same as infra/dev).
+    image: redis:8.10.2-alpine@sha256:3811787313eba226a2ef38658c6ccb91cd5e110edc89c37767de373120a0e5a0
+    restart: unless-stopped
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?}
+    # AUTH required, AOF on, BullMQ needs `noeviction`. No published port (T-CP-6). The password is on the
+    # command line inside this container only.
+    command:
+      - sh
+      - -c
+      - >-
+        exec redis-server --requirepass "$$REDIS_PASSWORD" --appendonly yes --appendfsync everysec
+        --save 300 10 --maxmemory 256mb --maxmemory-policy noeviction --protected-mode yes
+    volumes:
+      - redisdata:/data
+    networks:
+      internal:
+        aliases: [remyral-redis]
+    mem_limit: 320m
+    security_opt: ['no-new-privileges:true']
+    healthcheck:
+      test: ['CMD-SHELL', 'REDISCLI_AUTH="$$REDIS_PASSWORD" redis-cli ping | grep -q PONG']
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+    labels:
+      - traefik.enable=false
+
+  migrate:
+    image: ${REMYRAL_MASTER_IMAGE:-remyral-master:local}
+    pull_policy: ${REMYRAL_PULL_POLICY:-never}
+    <<: *hardening
+    command: ['migrate']
+    restart: 'no'
+    environment:
+      NODE_ENV: production
+      # The migration owner; the schema it creates is used by remyral_app at runtime.
+      DATABASE_URL: postgres://${REMYRAL_DB_ROLE_PREFIX:-remyral}_owner:${REMYRAL_DB_OWNER_PASSWORD:?}@remyral-pg:5432/${REMYRAL_DB_NAME:-remyral}
+      # Validated by the shared config loader but not used by `migrate` (no Redis, no keys needed).
+      REDIS_URL: redis://unused.invalid:6379/0
+      TOTP_KEY_FILE: /nonexistent/totp.key
+      LEASE_SIGNING_KEY_FILE: /nonexistent/lease-signing.pem
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [internal]
+    mem_limit: 256m
+    labels:
+      - traefik.enable=false
+
+  master:
+    image: ${REMYRAL_MASTER_IMAGE:-remyral-master:local}
+    pull_policy: ${REMYRAL_PULL_POLICY:-never}
+    <<: *hardening
+    command: ['serve']
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 20s
+    environment:
+      <<: *master-env
+    volumes:
+      - ${REMYRAL_SECRETS_DIR:-/data/remyral/prod/secrets}:/run/secrets/remyral:ro
+      # p10-backup-restore: only the status sub-directory of the backups (no dump is visible to the master).
+      - ${REMYRAL_BACKUP_DIR:-/data/remyral/${REMYRAL_ENV:-prod}/backups}/status:/run/remyral-backup:ro
+      # p16-selfhost-onboarding: the signed update feed cached by remyral-ctl (empty on Coolify / EC2 installs).
+      - ${REMYRAL_UPDATE_DIR:-/data/remyral/${REMYRAL_ENV:-prod}/update}:/run/remyral-update:ro
+      # p17-object-storage: the local blob directory (BLOB_DATA_DIR): job outputs and other files when no object storage
+      # is configured, and those stored before a bucket was chosen. Backed up by the backup service (read-only there).
+      - blobdata:/var/lib/remyral/blobs
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      internal: {}
+      proxy:
+        # p5-coolify-sso: stable name for Traefik's forwardAuth (infra/coolify-sso/remana-coolify-sso.yaml).
+        aliases: ['${REMYRAL_PROJECT:-remyral-${REMYRAL_ENV:-prod}}-master']
+    mem_limit: 768m
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - fetch('http://127.0.0.1:8080/healthz').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 20s
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=${PROXY_NETWORK:-coolify}
+      - traefik.http.services.${REMYRAL_PROJECT:-remyral-${REMYRAL_ENV:-prod}}-master.loadbalancer.server.port=8080
+      # /api/* → master without the /api prefix (p1-web-skeleton §3).
+      - traefik.http.middlewares.${REMYRAL_PROJECT:-remyral-${REMYRAL_ENV:-prod}}-api-strip.stripprefix.prefixes=/api
+      - traefik.http.routers.${REMYRAL_PROJECT:-remyral-${REMYRAL_ENV:-prod}}-api.rule=Host(`${REMYRAL_DOMAIN:?}`) && (Path(`/api`) || PathPrefix(`/api/`))
+      - traefik.http.routers.${REMYRAL_PROJECT:-remyral-${REMYRAL_ENV:-prod}}-api.entrypoints=${PROXY_ENTRYPOINT:-https}
+      - traefik.http.routers.${REMYRAL_PROJECT:-remyral-${REMYRAL_ENV:-prod}}-api.tls=true
+      - traefik.http.routers.${REMYRAL_PROJECT:-remyral-${REMYRAL_ENV:-prod}}-api.priority=100
+      - traefik.http.routers.${REMYRAL_PROJECT:-remyral-${REMYRAL_ENV:-prod}}-api.middlewares=${REMYRAL_PROJECT:-remyral-${REMYRAL_ENV:-prod}}-api-strip
+      - traefik.http.routers.${REMYRAL_PROJECT:-remyral-${REMYRAL_ENV:-prod}}-api.service=${REMYRAL_PROJECT:-remyral-${REMYRAL_ENV:-prod}}-master
+      # Automation triggers (p6-automations, ADR-0024): GitHub App deliveries and signed webhooks. Public by
+      # design, authenticated by the signature over the raw body; rate- and body-limited by the master.
+      - traefik.http.routers.${REMYRAL_PROJECT:-remyral-${REMYRAL_ENV:-prod}}-hooks.rule=Host(`${REMYRAL_DOMAIN:?}`) && PathPrefix(`/v1/hooks/`)
+      - traefik.http.routers.${REMYRAL_PROJECT:-remyral-${REMYRAL_ENV:-prod}}-hooks.entrypoints=${PROXY_ENTRYPOINT:-https}
+      - traefik.http.routers.${REMYRAL_PROJECT:-remyral-${REMYRAL_ENV:-prod}}-hooks.tls=true
+      - traefik.http.routers.${REMYRAL_PROJECT:-remyral-${REMYRAL_ENV:-prod}}-hooks.priority=100
+      - traefik.http.routers.${REMYRAL_PROJECT:-remyral-${REMYRAL_ENV:-prod}}-hooks.service=${REMYRAL_PROJECT:-remyral-${REMYRAL_ENV:-prod}}-master
+      # Worker transport (WebSocket), release downloads and installer downloads (p2-transport,
+      # p2-signed-updates, p5-worker-onboarding).
+      # p17-object-storage: /v1/worker/blobs/ — large outputs of workers in local-disk mode (one-time upload tokens).
+      - traefik.http.routers.${REMYRAL_PROJECT:-remyral-${REMYRAL_ENV:-prod}}-worker.rule=Host(`${REMYRAL_DOMAIN:?}`) && (Path(`/v1/worker`) || PathPrefix(`/v1/worker/releases/`) || PathPrefix(`/v1/worker/install/`) || Path(`/v1/worker/lease-keys`) || PathPrefix(`/v1/worker/blobs/`))
+      - traefik.http.routers.${REMYRAL_PROJECT:-remyral-${REMYRAL_ENV:-prod}}-worker.entrypoints=${PROXY_ENTRYPOINT:-https}
+      - traefik.http.routers.${REMYRAL_PROJECT:-remyral-${REMYRAL_ENV:-prod}}-worker.tls=true
+      - traefik.http.routers.${REMYRAL_PROJECT:-remyral-${REMYRAL_ENV:-prod}}-worker.priority=100
+      - traefik.http.routers.${REMYRAL_PROJECT:-remyral-${REMYRAL_ENV:-prod}}-worker.service=${REMYRAL_PROJECT:-remyral-${REMYRAL_ENV:-prod}}-master
+      # p19-ide W2 (ADR-0066): the Tam IDE origin to the master, every path, no /api strip. Enable once REMYRAL_IDE_DOMAIN
+      # (and IDE_ORIGIN=https://<it>) is set — Traefik refuses a router with an empty Host().
+      # - traefik.http.routers.${REMYRAL_PROJECT:-remyral-${REMYRAL_ENV:-prod}}-ide.rule=Host(`${REMYRAL_IDE_DOMAIN}`)
+      # - traefik.http.routers.${REMYRAL_PROJECT:-remyral-${REMYRAL_ENV:-prod}}-ide.entrypoints=${PROXY_ENTRYPOINT:-https}
+      # - traefik.http.routers.${REMYRAL_PROJECT:-remyral-${REMYRAL_ENV:-prod}}-ide.tls=true
+      # - traefik.http.routers.${REMYRAL_PROJECT:-remyral-${REMYRAL_ENV:-prod}}-ide.priority=100
+      # - traefik.http.routers.${REMYRAL_PROJECT:-remyral-${REMYRAL_ENV:-prod}}-ide.service=${REMYRAL_PROJECT:-remyral-${REMYRAL_ENV:-prod}}-master
+
+  # p10-backup-restore (docs/design/p10-backup-restore.md, docs/ops/backup-restore.md): nightly consistent pg_dump +
+  # manifest, age-encrypted recovery secrets (owner's PUBLIC keys in backup-config/recipients.txt), optional
+  # off-site S3/R2 copy (backup-config/offsite.env), local retention and a weekly restore drill into a throw-away
+  # Postgres inside this container (no TCP listener). Profile `backup`: started only when named (the deploy does);
+  # `compose up` without service names (Coolify, pnpm e2e:compose) leaves it out. No Docker socket, no port.
+  backup:
+    image: ${REMYRAL_BACKUP_IMAGE:-remyral-backup:local}
+    pull_policy: ${REMYRAL_PULL_POLICY:-never}
+    profiles: [backup]
+    command: ['daemon']
+    restart: unless-stopped
+    init: true
+    read_only: true
+    # CHOWN + SETUID/SETGID: the drill's throw-away server runs as `postgres`; DAC_READ_SEARCH: read the secrets
+    # files (owned by uid 10001, mode 0400) into the encrypted archive. Nothing else.
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_READ_SEARCH, SETUID, SETGID]
+    security_opt: ['no-new-privileges:true']
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    stop_grace_period: 30s
+    environment:
+      BACKUP_ENV: ${REMYRAL_ENV:-prod}
+      # Read-only role (pg_read_all_data, default_transaction_read_only); docs/ops/backups.md §3.
+      PGHOST: remyral-pg
+      PGPORT: '5432'
+      PGUSER: ${REMYRAL_DB_ROLE_PREFIX:-remyral}_backup
+      PGDATABASE: ${REMYRAL_DB_NAME:-remyral}
+      PGPASSWORD: ${REMYRAL_DB_BACKUP_PASSWORD:-}
+      # Schedule (UTC): empty = nightly at 02:30; BACKUP_INTERVAL_MINUTES (15..10080) for more frequent runs.
+      BACKUP_TIME: ${BACKUP_TIME:-}
+      BACKUP_INTERVAL_MINUTES: ${BACKUP_INTERVAL_MINUTES:-}
+      BACKUP_KEEP_DAILY: ${BACKUP_KEEP_DAILY:-}
+      BACKUP_KEEP_WEEKLY: ${BACKUP_KEEP_WEEKLY:-}
+      BACKUP_KEEP_MONTHLY: ${BACKUP_KEEP_MONTHLY:-}
+      BACKUP_KEEP_RECENT_HOURS: ${BACKUP_KEEP_RECENT_HOURS:-}
+      BACKUP_DRILL_ENABLED: ${BACKUP_DRILL_ENABLED:-}
+      BACKUP_DRILL_WEEKDAY: ${BACKUP_DRILL_WEEKDAY:-}
+      BACKUP_DRILL_TIME: ${BACKUP_DRILL_TIME:-}
+      # p11-master-resilience: ship archived WAL (every 30 s) and take a daily physical base backup.
+      BACKUP_WAL_ARCHIVE: ${PG_WAL_ARCHIVE:-off}
+    volumes:
+      - ${REMYRAL_BACKUP_DIR:-/data/remyral/${REMYRAL_ENV:-prod}/backups}:/backups
+      # p11-master-resilience: archived WAL (written by postgres; the runner removes shipped segments as uid 70) and
+      # the data directory, read-only, for the base backup (pg_backup_start/stop keep it consistent).
+      - walarchive:/wal-archive
+      - pgdata:/pgdata:ro
+      # p17-object-storage: the master's local blob directory, mirrored encrypted into the backup (and off-site).
+      - blobdata:/blobs:ro
+      - ${REMYRAL_STACK_ENV_FILE:-/data/remyral/${REMYRAL_ENV:-prod}/stack.env}:/source/stack.env:ro
+      - ${REMYRAL_SECRETS_DIR:-/data/remyral/prod/secrets}:/source/secrets:ro
+      - ${REMYRAL_BACKUP_CONFIG_DIR:-/data/remyral/${REMYRAL_ENV:-prod}/backup-config}:/source/backup-config:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [internal]
+    mem_limit: ${BACKUP_MEM_LIMIT:-768m}
+    shm_size: 128m
+    labels:
+      - traefik.enable=false
+
+  web:
+    image: ${REMYRAL_WEB_IMAGE:-remyral-web:local}
+    pull_policy: ${REMYRAL_PULL_POLICY:-never}
+    <<: *hardening
+    restart: unless-stopped
+    networks:
+      proxy:
+        # p16-observability: the master's status page probes the console under this name (STATUS_WEB_URL).
+        aliases: ['${REMYRAL_PROJECT:-remyral-${REMYRAL_ENV:-prod}}-web']
+    mem_limit: 64m
+    healthcheck:
+      test: ['CMD', 'wget', '-q', '-O', '/dev/null', 'http://127.0.0.1:8080/index.html']
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=${PROXY_NETWORK:-coolify}
+      - traefik.http.services.${REMYRAL_PROJECT:-remyral-${REMYRAL_ENV:-prod}}-web.loadbalancer.server.port=8080
+      # Everything not claimed by a master router: the static console (lowest priority).
+      - traefik.http.routers.${REMYRAL_PROJECT:-remyral-${REMYRAL_ENV:-prod}}-web.rule=Host(`${REMYRAL_DOMAIN:?}`)
+      - traefik.http.routers.${REMYRAL_PROJECT:-remyral-${REMYRAL_ENV:-prod}}-web.entrypoints=${PROXY_ENTRYPOINT:-https}
+      - traefik.http.routers.${REMYRAL_PROJECT:-remyral-${REMYRAL_ENV:-prod}}-web.tls=true
+      - traefik.http.routers.${REMYRAL_PROJECT:-remyral-${REMYRAL_ENV:-prod}}-web.priority=1
+      - traefik.http.routers.${REMYRAL_PROJECT:-remyral-${REMYRAL_ENV:-prod}}-web.service=${REMYRAL_PROJECT:-remyral-${REMYRAL_ENV:-prod}}-web
+      # Not public: probes, the worker endpoint and the Coolify SSO internals under /api go to the web server, which answers 404 for
+      # every /api path. /healthz and /readyz without /api fall to the console (index.html), never the master.
+      # p5-coolify-sso: forward-auth is called by Traefik over the Docker network and the SSO callback only on the
+      # Coolify host — neither is reachable through the console's /api route.
+      - traefik.http.routers.${REMYRAL_PROJECT:-remyral-${REMYRAL_ENV:-prod}}-blocked.rule=Host(`${REMYRAL_DOMAIN:?}`) && (Path(`/api/healthz`) || Path(`/api/readyz`) || Path(`/api/v1/worker`) || PathPrefix(`/api/v1/worker/`) || PathPrefix(`/api/forward-auth/`) || Path(`/api/coolify-sso/callback`) || PathPrefix(`/api/v1/hooks/`))
+      - traefik.http.routers.${REMYRAL_PROJECT:-remyral-${REMYRAL_ENV:-prod}}-blocked.entrypoints=${PROXY_ENTRYPOINT:-https}
+      - traefik.http.routers.${REMYRAL_PROJECT:-remyral-${REMYRAL_ENV:-prod}}-blocked.tls=true
+      - traefik.http.routers.${REMYRAL_PROJECT:-remyral-${REMYRAL_ENV:-prod}}-blocked.priority=200
+      - traefik.http.routers.${REMYRAL_PROJECT:-remyral-${REMYRAL_ENV:-prod}}-blocked.service=${REMYRAL_PROJECT:-remyral-${REMYRAL_ENV:-prod}}-web
+      # Plain HTTP (only reachable if someone bypasses Cloudflare): permanent redirect to HTTPS.
+      - traefik.http.middlewares.${REMYRAL_PROJECT:-remyral-${REMYRAL_ENV:-prod}}-to-https.redirectscheme.scheme=https
+      - traefik.http.middlewares.${REMYRAL_PROJECT:-remyral-${REMYRAL_ENV:-prod}}-to-https.redirectscheme.permanent=true
+      - traefik.http.routers.${REMYRAL_PROJECT:-remyral-${REMYRAL_ENV:-prod}}-http.rule=Host(`${REMYRAL_DOMAIN:?}`)
+      - traefik.http.routers.${REMYRAL_PROJECT:-remyral-${REMYRAL_ENV:-prod}}-http.entrypoints=${PROXY_HTTP_ENTRYPOINT:-http}
+      - traefik.http.routers.${REMYRAL_PROJECT:-remyral-${REMYRAL_ENV:-prod}}-http.middlewares=${REMYRAL_PROJECT:-remyral-${REMYRAL_ENV:-prod}}-to-https
+      - traefik.http.routers.${REMYRAL_PROJECT:-remyral-${REMYRAL_ENV:-prod}}-http.service=${REMYRAL_PROJECT:-remyral-${REMYRAL_ENV:-prod}}-web
+
+networks:
+  # Data plane: Postgres, Redis, migrate, master. Not attached to the proxy.
+  internal: {}
+  # The network the Coolify proxy (Traefik) is attached to on every server.
+  proxy:
+    name: ${PROXY_NETWORK:-coolify}
+    external: true
+
+volumes:
+  pgdata: {}
+  redisdata: {}
+  # p11-master-resilience: archived WAL between postgres and the backup service (shipped segments are removed).
+  walarchive: {}
+  # p17-object-storage: the master's local blob directory (owned by uid 10001 from the image's empty directory).
+  blobdata: {}

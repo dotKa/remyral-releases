@@ -1,0 +1,35 @@
+{
+  "schema": 1,
+  "name": "remyral-control-plane",
+  "version": "0.9.0",
+  "channel": "stable",
+  "commit": "554b6f59412874cc4163c3ac997df8e78c0c4482",
+  "createdAt": "2026-11-26T12:53:03.055Z",
+  "images": {
+    "master": "ghcr.io/dotka/remyral-master@sha256:e006be3b7cfd1bd2c1ad89da36c9e52d6898883f373998fab07a98bda3a9198c",
+    "web": "ghcr.io/dotka/remyral-web@sha256:f355789191fb2bd64484650777252ff478cdd5da27658a90bcb09b18cef1b7e7",
+    "backup": "ghcr.io/dotka/remyral-backup@sha256:d85d7a615dd9139def460a4b5dc90f43ae8e8216e07970b0ae1d83346e5ab1c5"
+  },
+  "minWorkerVersion": "1.2.21",
+  "migrationsHead": "0222",
+  "breaking": [],
+  "requirements": {
+    "docker": "24.0.0",
+    "compose": "2.24.0",
+    "openssl": "3.0.0",
+    "memoryMiB": 3500,
+    "diskGiB": 10
+  },
+  "trustedKeys": [
+    "WdOSMgYAE6UjtBX32o62ho-mW-tVZ-SkuNHK7Dl4W6w"
+  ],
+  "files": {
+    "compose.yaml": "4c2a652ee0a747c3ba082dfe4ddc65a185bb47d54f92a71dba9d11ef7eb577ee",
+    "compose.selfhost.yaml": "71d1f49bd351a44ad5846a275c2e95c45ee94a4ca5457c2d26de3dad9f97e274",
+    "remyral-ctl": "79a1532ee5a9ceabd3b825931f513a5dad75dd374dbc1081619af29e3eacaf8b",
+    "install.sh": "79a1532ee5a9ceabd3b825931f513a5dad75dd374dbc1081619af29e3eacaf8b",
+    "NOTES.md": "cfaca581c3613f82f90e718d37cf3520fb81779c812fe6fe4d3ebccc5d1eee24",
+    "INSTALL.md": "67c8feb05222a5f7ee13aa5bb112d86f6f1cc090cf537babe77c427688a656a4",
+    "KURULUM.md": "3d241e22fcfd186ca690758b9157d5a92165b58b31a3b14f51812d34aa8e9061"
+  }
+}

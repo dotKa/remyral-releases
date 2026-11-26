@@ -1,0 +1,55 @@
+# Self-hosted overlay (p16-selfhost-onboarding, docs/design/p16-selfhost-onboarding.md, ADR-0063).
+#
+# Used together with infra/coolify/compose.yaml by `remyral-ctl` (infra/selfhost/remyral-ctl):
+#
+#   docker compose -p remyral-prod --env-file <data>/stack.env --env-file <data>/release.env \
+#     -f compose.yaml -f compose.selfhost.yaml --profile backup up -d
+#
+# It adds the one thing a Coolify host provides and a plain Docker host does not: the Traefik proxy on the network
+# the master and web routers attach to (PROXY_NETWORK, created by remyral-ctl as `remyral-proxy`). Routing stays where
+# it is — the Traefik labels of master and web in compose.yaml — so a self-hosted install and the Coolify install
+# route identically. The static configuration (entry points, TLS mode, Let's Encrypt resolver, trusted proxies) is
+# written by remyral-ctl into <data>/proxy/traefik.yml for the chosen TLS mode.
+#
+# The Docker socket is mounted read-only into Traefik only (its Docker provider reads the labels; constrained to this
+# compose project). The master never gets the socket: upgrades run on the host (`remyral-ctl upgrade`).
+#
+# p17-domain-wizard (ADR-0063 amendment 2026-10-24): the master shares <data>/host with the host applier
+# (`remyral-ctl apply-pending`, a root systemd unit): `requests/` is writable by the master (uid 10001) for signed
+# domain change requests, `status/` is root-owned and read-only for the master (heartbeat, results). Only on a
+# remyral-ctl host: Coolify / EC2 installs have no applier, and the wizard then only stores the public address.
+# REMYRAL_HOST_DIR is written by remyral-ctl; the default matches the default data directory (an upgrade started by an
+# older remyral-ctl that does not write it yet).
+services:
+  master:
+    environment:
+      HOST_APPLIER_DIR: /run/remyral-host
+    volumes:
+      - ${REMYRAL_HOST_DIR:-/var/lib/remyral/host}/requests:/run/remyral-host/requests
+      - ${REMYRAL_HOST_DIR:-/var/lib/remyral/host}/status:/run/remyral-host/status:ro
+
+  proxy:
+    # traefik:v3.7.14, multi-arch index digest, pinned 2026-10-13 (same as infra/coolify/local/proxy.compose.yaml).
+    image: traefik:v3.7.14@sha256:575fa15b135078fe5e50aa847987d96dbddd7b093c172429618404df73f3fa7c
+    restart: unless-stopped
+    command: ['--configFile=/etc/traefik/traefik.yml']
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    security_opt: ['no-new-privileges:true']
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    ports:
+      - '${REMYRAL_BIND_ADDRESS:-0.0.0.0}:${REMYRAL_HTTP_PORT:-80}:80'
+      - '${REMYRAL_BIND_ADDRESS:-0.0.0.0}:${REMYRAL_HTTPS_PORT:-443}:443'
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ${REMYRAL_PROXY_DIR:?}/traefik.yml:/etc/traefik/traefik.yml:ro
+      - ${REMYRAL_PROXY_DIR:?}/dynamic:/etc/traefik/dynamic:ro
+      - ${REMYRAL_PROXY_DIR:?}/certs:/etc/traefik/certs:ro
+      # Let's Encrypt account and certificates (acme.json, 0600); empty in the other TLS modes.
+      - ${REMYRAL_ACME_DIR:?}:/letsencrypt
+    networks: [proxy]
+    mem_limit: 128m
+    labels:
+      - traefik.enable=false
